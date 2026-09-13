@@ -1,76 +1,128 @@
 # AWS Cognito Integration with TypeScript
 
-This repository demonstrates how to integrate AWS Cognito with a TypeScript application using the AWS SDK. It covers authentication and token validation, providing a practical example based on the ["OAuth2, JWT, and JWKS using Amazon Cognito as IdP"](https://dev.to/vynnux/oauth2-jwt-and-jwks-using-amazon-cognito-as-idp-1jod) article.
+This repository is the companion code for the article
+["OAuth2, JWT, and JWKS: Using Amazon Cognito as IdP"](https://dev.to/visepol/oauth2-jwt-and-jwks-using-amazon-cognito-as-idp-1jod) on Dev.to.
 
-## Features
+A copy of the article is kept in this repository at [`docs/oauth2-jwt-jwks-cognito.md`](./docs/oauth2-jwt-jwks-cognito.md), images included, so it stays readable if the original link ever goes away.
 
-- Sign in using AWS Cognito.
-- Fetch and validate JWT tokens.
-- Use JWKS for secure token verification.
+## Overview
 
-## Prerequisites
+A small [Fastify](https://fastify.dev/) API with two endpoints:
 
-Before using this demo, ensure you have the following:
+- `POST /authenticate` — sends the username and password to Cognito through the AWS SDK
+  (`InitiateAuth` with the `USER_PASSWORD_AUTH` flow) and returns the **ID token** issued
+  by the user pool.
+- `GET /verify-jwt` — reads the `kid` from the token header, fetches the matching public
+  key from the user pool's JWKS endpoint, and verifies the token's RS256 signature
+  (and its expiration) with `jsonwebtoken`.
 
-- **Node.js** (version 14 or higher).
-- **npm** or **yarn** for package management.
-- An AWS account with Cognito configured.
-  - A User Pool created in AWS Cognito.
-  - App Client ID and Secret.
-  - Domain name configured for the Cognito User Pool.
+## Getting Started
 
-## Setup
+### Prerequisites
 
-### Clone the Repository
+- Node.js 16 through 24
+  - 16 is the minimum required by `@aws-sdk/client-cognito-identity-provider`.
+  - Node.js 25 fails at startup: `buffer-equal-constant-time`, pulled in by
+    `jsonwebtoken → jws → jwa`, reads `SlowBuffer`, which Node.js 25 removed.
+- npm
+- An AWS account with a Cognito user pool, set up as described in the article:
+  - an app client of type **Public client** (no client secret — the code does not send a
+    `SECRET_HASH`) with the **ALLOW_USER_PASSWORD_AUTH** flow enabled;
+  - a user whose status is **Confirmed**. The article sets a permanent password with
+    `aws cognito-idp admin-set-user-password`, which requires AWS CLI credentials.
 
-```bash
-git clone <repository-url>
-cd <repository-name>
-```
+> **Tested environment:** the article was produced on Linux x86_64 (Ubuntu 20.04 under WSL).
+> Other platforms are untested against a real user pool.
 
-### Install Dependencies
+### Installation
 
-Run the following command to install required packages:
-
-```bash
+```sh
+git clone git@github.com:visepol/aws-cognito-w-jwks.git
+cd aws-cognito-w-jwks
 npm install
-# or
-yarn install
 ```
 
-### Configure Environment Variables
+Use `npm install` rather than `npm ci`: the lockfile was generated on Linux x86_64 and
+only records that platform's `esbuild` binary, so `npm ci` refuses to run elsewhere.
 
-Create a `.env` file in the root of the project and add the following values:
+### Configuring Environment Variables
 
-```env
-AWS_REGION=<your-aws-region>
-COGNITO_USER_POOL_ID=<your-user-pool-id>
-COGNITO_CLIENT_ID=<your-app-client-id>
-COGNITO_CLIENT_SECRET=<your-app-client-secret>
-COGNITO_DOMAIN=<your-cognito-domain>
+Copy `.env.example` to `.env` and fill in the values from your user pool:
+
+```sh
+cp .env.example .env
 ```
 
-Replace the placeholders with your AWS Cognito configuration values.
+| Variable            | Required | Description                                                                                                                                          |
+| ------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `COGNITO_CLIENT_ID` | yes      | ID of the app client (App integration → App client list).                                                                                            |
+| `AWS_REGION`        | no       | Region of the user pool. Defaults to `us-east-1`.                                                                                                    |
+| `JWKS_URI`          | yes      | The pool's "Token signing key URL": `https://cognito-idp.<region>.amazonaws.com/<user-pool-id>/.well-known/jwks.json`.                               |
+| `DEBUG`             | no       | Set to `jwks` to turn on `jwks-rsa` debug logging.                                                                                                   |
 
-## Usage
+### Running the Server
 
-### Start the Application
-
-Run the following command to start the demo:
-
-```bash
+```sh
 npm start
-# or
-yarn start
 ```
 
-### Example Endpoints
+This runs `tsx watch src/server.ts`, which reloads on file changes. The server listens on
+`0.0.0.0:3000` and prints:
 
-1. **Sign In**: Authenticate a user and retrieve JWT tokens.
-2. **Token Validation**: Validate JWT tokens using the Cognito JWKS.
+```
+🍃 HTTTP Server Running.
+```
 
-Refer to the source code for detailed implementation.
+## Making Requests
 
-## Related Resources
+[`request.http`](./request.http) holds both requests, ready for the VS Code REST Client
+extension or the JetBrains HTTP Client. Replace the credentials with your user's, and
+`<Token>` with the token returned by `/authenticate`. With curl:
 
-For a detailed explanation of the concepts and implementation, check out the article on [Dev.to](https://dev.to/vynnux/oauth2-jwt-and-jwks-using-amazon-cognito-as-idp-1jod).
+```sh
+curl -X POST http://localhost:3000/authenticate \
+  -H 'content-type: application/json' \
+  -d '{"username": "<username or email>", "password": "<password>"}'
+
+curl http://localhost:3000/verify-jwt \
+  -H 'Authorization: Bearer <token>'
+```
+
+### Responses
+
+| Endpoint             | Situation                                                               | Status |
+| -------------------- | ----------------------------------------------------------------------- | ------ |
+| `POST /authenticate` | Valid credentials                                                       | `201` with `{ "token": "..." }` |
+| `POST /authenticate` | Cognito answers with a challenge instead of tokens (e.g. the user still has to change the password) | `401` |
+| `GET /verify-jwt`    | Valid signature, not expired                                            | `200` |
+| `GET /verify-jwt`    | Token that cannot be decoded                                            | `401` |
+
+Every other failure reaches the generic error handler in `src/app.ts`, which logs the
+error and responds with `500`. That includes wrong credentials (Cognito throws
+`NotAuthorizedException`), an invalid or expired signature, a `kid` not present in the
+JWKS, a missing `Authorization` header, and a request body that fails validation.
+
+> **Scope of the validation:** `/verify-jwt` only checks the signature and the `exp` claim.
+> It does not check `iss`, `aud`, or `token_use`, which a production resource server
+> should also validate.
+
+## Project Structure
+
+```sh
+aws-cognito-w-jwks/
+│── src/
+│   ├── server.ts                        # Loads .env and starts the server on port 3000
+│   ├── app.ts                           # Fastify instance, routes, and error handler
+│   ├── http/
+│   │   ├── _routes.ts                   # Route registration
+│   │   ├── authenticate.controller.ts   # POST /authenticate
+│   │   └── verify-jwt.controller.ts     # GET /verify-jwt
+│   └── lib/
+│       ├── cognito.ts                   # InitiateAuth call (USER_PASSWORD_AUTH)
+│       └── jwks.ts                      # JWKS lookup and signature verification
+│── docs/                                # Local copy of the Dev.to article + its images
+│── request.http                         # Example requests
+│── .env.example                         # Environment variables template
+│── package.json                         # Dependencies and scripts
+└── README.md                            # Project documentation
+```
